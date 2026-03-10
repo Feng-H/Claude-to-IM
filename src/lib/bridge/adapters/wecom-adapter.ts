@@ -36,7 +36,7 @@ interface WeComCallbackBody {
   chatid?: string;
   chattype: 'single' | 'group';
   from: { userid: string };
-  msgtype: 'text' | 'image' | 'mixed' | 'voice' | 'file' | 'event';
+  msgtype: 'text' | 'image' | 'mixed' | 'voice' | 'file' | 'event' | 'stream';
   text?: { content: string };
   image?: { url: string; aeskey?: string };
   mixed?: { msg_item: Array<{ msgtype: string; text?: { content: string }; image?: { url: string } }> };
@@ -47,7 +47,7 @@ interface WeComCallbackBody {
 
 // Message FROM WeCom server (envelope)
 interface WeComServerMessage {
-  cmd: string;
+  cmd?: string;
   headers: { req_id: string };
   body?: WeComCallbackBody;
   errcode?: number;
@@ -68,6 +68,12 @@ interface PendingRequest {
   streamId?: string;
 }
 
+interface PendingSubscribe {
+  reqId: string;
+  resolve: () => void;
+  reject: (err: Error) => void;
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 function uuid(): string {
@@ -86,6 +92,7 @@ export class WeComAdapter extends BaseChannelAdapter {
   private seenMessageIds = new Map<string, boolean>();
   private config: WeComConfig | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
+  private pendingSubscribes = new Map<string, PendingSubscribe>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectAttempts = 0;
   private shouldReconnect = false;
@@ -100,12 +107,13 @@ export class WeComAdapter extends BaseChannelAdapter {
     }
 
     this.config = this.loadConfig();
+    console.log('[wecom-adapter] Config loaded');
     this._running = true;
     this.shouldReconnect = true;
     this.reconnectAttempts = 0;
 
     await this.connect();
-    console.log('[wecom-adapter] Started');
+    console.log('[wecom-adapter] Started successfully');
   }
 
   async stop(): Promise<void> {
@@ -125,6 +133,7 @@ export class WeComAdapter extends BaseChannelAdapter {
     this.queue = [];
     this.seenMessageIds.clear();
     this.pendingRequests.clear();
+    this.pendingSubscribes.clear();
 
     console.log('[wecom-adapter] Stopped');
   }
@@ -216,69 +225,117 @@ export class WeComAdapter extends BaseChannelAdapter {
 
   private async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      console.log('[wecom-adapter] Connecting to', GATEWAY_URL);
       const ws = new WebSocket(GATEWAY_URL);
       this.ws = ws;
       let resolved = false;
 
       ws.on('open', () => {
-        console.log('[wecom-adapter] Connected, subscribing...');
-        this.subscribe();
+        console.log('[wecom-adapter] WebSocket connected, subscribing...');
+        this.subscribe()
+          .then(() => {
+            if (!resolved) {
+              resolved = true;
+              this.reconnectAttempts = 0;
+              this.startHeartbeat();
+              resolve();
+            }
+          })
+          .catch((err) => {
+            if (!resolved) {
+              resolved = true;
+              reject(err);
+            }
+          });
       });
 
       ws.on('message', (data) => {
         try {
           const msg = JSON.parse(data.toString()) as WeComServerMessage;
           this.handleMessage(msg);
-          if (msg.cmd === 'aibot_subscribe' && msg.errcode === 0 && !resolved) {
-            resolved = true;
-            this.reconnectAttempts = 0;
-            this.startHeartbeat();
-            resolve();
-          }
         } catch (err) {
           console.error('[wecom-adapter] Parse error:', err);
         }
       });
 
       ws.on('close', (code, reason) => {
-        console.log(`[wecom-adapter] Closed: ${code} ${reason}`);
+        console.log('[wecom-adapter] Closed:', code, reason.toString());
         this.stopHeartbeat();
         if (!resolved) {
           resolved = true;
-          reject(new Error(`Closed before subscribe: ${code}`));
+          reject(new Error('Closed before subscribe: ' + code));
           return;
         }
         if (this.shouldReconnect) this.scheduleReconnect();
       });
 
       ws.on('error', (err) => {
-        console.error('[wecom-adapter] Error:', err.message);
+        console.error('[wecom-adapter] WebSocket error:', err.message);
       });
     });
   }
 
-  private subscribe(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const msg: WeComClientMessage = {
-      cmd: 'aibot_subscribe',
-      headers: { req_id: uuid() },
-      body: { bot_id: this.config!.botId, secret: this.config!.secret },
-    };
-    this.ws.send(JSON.stringify(msg));
+  private subscribe(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('WebSocket not open'));
+        return;
+      }
+      const reqId = uuid();
+      const msg: WeComClientMessage = {
+        cmd: 'aibot_subscribe',
+        headers: { req_id: reqId },
+        body: { bot_id: this.config!.botId, secret: this.config!.secret },
+      };
+      
+      this.pendingSubscribes.set(reqId, { reqId, resolve, reject });
+      console.log('[wecom-adapter] Sending subscribe request...');
+      this.ws.send(JSON.stringify(msg));
+      
+      // Timeout after 10 seconds
+      setTimeout(() => {
+        if (this.pendingSubscribes.has(reqId)) {
+          this.pendingSubscribes.delete(reqId);
+          reject(new Error('Subscribe timeout'));
+        }
+      }, 10000);
+    });
   }
 
   private handleMessage(msg: WeComServerMessage): void {
-    switch (msg.cmd) {
-      case 'aibot_subscribe':
-        if (msg.errcode === 0) console.log('[wecom-adapter] Subscribed');
-        else console.error('[wecom-adapter] Subscribe failed:', msg.errmsg);
-        break;
+    const reqId = msg.headers?.req_id;
+    
+    // Check if this is a subscribe response
+    const pendingSub = this.pendingSubscribes.get(reqId);
+    if (pendingSub) {
+      this.pendingSubscribes.delete(reqId);
+      if (msg.errcode === 0) {
+        console.log('[wecom-adapter] Subscribe successful');
+        pendingSub.resolve();
+      } else {
+        console.error('[wecom-adapter] Subscribe failed:', msg.errcode, msg.errmsg);
+        pendingSub.reject(new Error('Subscribe failed: ' + (msg.errmsg || msg.errcode)));
+      }
+      return;
+    }
+
+    // Handle other messages
+    const cmd = msg.cmd || '';
+    switch (cmd) {
       case 'aibot_msg_callback':
         this.handleMsgCallback(msg);
         break;
       case 'aibot_event_callback':
         this.handleEventCallback(msg);
         break;
+      case 'pong':
+      case 'ping':
+        // Heartbeat response, ignore
+        break;
+      default:
+        if (msg.errcode !== undefined && msg.errcode !== 0) {
+          console.warn('[wecom-adapter] Error response:', msg.errcode, msg.errmsg);
+        }
     }
   }
 
@@ -325,6 +382,8 @@ export class WeComAdapter extends BaseChannelAdapter {
 
     if (!text.trim()) return;
 
+    console.log('[wecom-adapter] Received message from', userId, ':', text.slice(0, 50));
+    
     this.enqueue({
       messageId: body.msgid,
       address: { channelType: 'wecom', chatId, userId, displayName: userId.slice(0, 8) },
@@ -376,6 +435,7 @@ export class WeComAdapter extends BaseChannelAdapter {
         this.ws.send(JSON.stringify(msg));
       }
     }, HEARTBEAT_INTERVAL);
+    console.log('[wecom-adapter] Heartbeat started (30s interval)');
   }
 
   private stopHeartbeat(): void {
@@ -389,7 +449,7 @@ export class WeComAdapter extends BaseChannelAdapter {
     if (!this.shouldReconnect) return;
     this.reconnectAttempts++;
     const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1), MAX_RECONNECT_DELAY);
-    console.log(`[wecom-adapter] Reconnecting in ${delay}ms`);
+    console.log('[wecom-adapter] Reconnecting in', delay, 'ms');
     setTimeout(async () => {
       if (!this.shouldReconnect) return;
       try {
