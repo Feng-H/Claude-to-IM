@@ -3,15 +3,6 @@
  *
  * Uses WebSocket long connection for receiving messages and replying.
  * This approach does NOT require a public IP or message encryption.
- *
- * Based on official @wecom/aibot-node-sdk pattern.
- *
- * Message flow:
- * 1. Connect to wss://openws.work.weixin.qq.com
- * 2. Subscribe with BotID + Secret
- * 3. Receive messages via aibot_msg_callback
- * 4. Reply via aibot_respond_msg (supports streaming)
- * 5. Keep alive with ping heartbeat
  */
 
 import crypto from 'crypto';
@@ -25,16 +16,9 @@ import type {
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
 
-/** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
-
-/** WebSocket gateway URL. */
 const GATEWAY_URL = 'wss://openws.work.weixin.qq.com';
-
-/** Heartbeat interval (30 seconds). */
 const HEARTBEAT_INTERVAL = 30000;
-
-/** Reconnect delay base (exponential backoff). */
 const RECONNECT_BASE_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 60000;
 
@@ -45,16 +29,7 @@ interface WeComConfig {
   secret: string;
 }
 
-interface WeComMessage {
-  cmd: string;
-  headers: {
-    req_id: string;
-  };
-  body?: WeComCallbackBody;
-  errcode?: number;
-  errmsg?: string;
-}
-
+// Message FROM WeCom server (callback)
 interface WeComCallbackBody {
   msgid: string;
   aibotid: string;
@@ -70,6 +45,22 @@ interface WeComCallbackBody {
   event?: { eventtype: string };
 }
 
+// Message FROM WeCom server (envelope)
+interface WeComServerMessage {
+  cmd: string;
+  headers: { req_id: string };
+  body?: WeComCallbackBody;
+  errcode?: number;
+  errmsg?: string;
+}
+
+// Message TO WeCom server
+interface WeComClientMessage {
+  cmd: string;
+  headers: { req_id: string };
+  body?: Record<string, unknown>;
+}
+
 interface PendingRequest {
   chatId: string;
   reqId: string;
@@ -77,14 +68,10 @@ interface PendingRequest {
   streamId?: string;
 }
 
-// ── Helper Functions ────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────
 
-function generateReqId(): string {
+function uuid(): string {
   return crypto.randomUUID();
-}
-
-function generateStreamId(): string {
-  return crypto.randomUUID().replace(/-/g, '');
 }
 
 // ── WeCom Adapter ───────────────────────────────────────────────
@@ -103,8 +90,6 @@ export class WeComAdapter extends BaseChannelAdapter {
   private reconnectAttempts = 0;
   private shouldReconnect = false;
 
-  // ── Lifecycle ───────────────────────────────────────────────
-
   async start(): Promise<void> {
     if (this._running) return;
 
@@ -120,7 +105,6 @@ export class WeComAdapter extends BaseChannelAdapter {
     this.reconnectAttempts = 0;
 
     await this.connect();
-
     console.log('[wecom-adapter] Started');
   }
 
@@ -132,16 +116,11 @@ export class WeComAdapter extends BaseChannelAdapter {
     this.stopHeartbeat();
 
     if (this.ws) {
-      try {
-        this.ws.close(1000, 'adapter stopping');
-      } catch { /* ignore */ }
+      try { this.ws.close(1000, 'stopping'); } catch {}
       this.ws = null;
     }
 
-    // Wake all waiters with null
-    for (const waiter of this.waiters) {
-      waiter(null);
-    }
+    for (const waiter of this.waiters) waiter(null);
     this.waiters = [];
     this.queue = [];
     this.seenMessageIds.clear();
@@ -154,41 +133,28 @@ export class WeComAdapter extends BaseChannelAdapter {
     return this._running;
   }
 
-  // ── Queue ───────────────────────────────────────────────────
-
   consumeOne(): Promise<InboundMessage | null> {
     const queued = this.queue.shift();
     if (queued) return Promise.resolve(queued);
-
     if (!this._running) return Promise.resolve(null);
-
-    return new Promise<InboundMessage | null>((resolve) => {
-      this.waiters.push(resolve);
-    });
+    return new Promise((resolve) => { this.waiters.push(resolve); });
   }
 
   private enqueue(msg: InboundMessage): void {
     const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(msg);
-    } else {
-      this.queue.push(msg);
-    }
+    if (waiter) waiter(msg);
+    else this.queue.push(msg);
   }
-
-  // ── Send ────────────────────────────────────────────────────
 
   async send(message: OutboundMessage): Promise<SendResult> {
     const pending = this.pendingRequests.get(message.address.chatId);
     if (!pending) {
-      return { ok: false, error: 'No pending request for this chat. User must send a message first.' };
+      return { ok: false, error: 'No pending request for this chat' };
     }
-
     if (Date.now() > pending.expiresAt) {
       this.pendingRequests.delete(message.address.chatId);
-      return { ok: false, error: 'Request expired (24h limit for replies)' };
+      return { ok: false, error: 'Request expired' };
     }
-
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { ok: false, error: 'WebSocket not connected' };
     }
@@ -196,7 +162,6 @@ export class WeComAdapter extends BaseChannelAdapter {
     try {
       let content = message.text;
       if (message.parseMode === 'HTML') {
-        // Convert HTML to Markdown for WeCom
         content = content.replace(/<br\s*\/?>/gi, '\n');
         content = content.replace(/<b>(.*?)<\/b>/gi, '**$1**');
         content = content.replace(/<i>(.*?)<\/i>/gi, '*$1*');
@@ -205,20 +170,15 @@ export class WeComAdapter extends BaseChannelAdapter {
         content = content.replace(/<[^>]+>/g, '');
       }
 
-      // Use streaming message for better UX
-      const streamId = pending.streamId || generateStreamId();
+      const streamId = pending.streamId || uuid().replace(/-/g, '');
       pending.streamId = streamId;
 
-      const msg: WeComMessage = {
+      const msg: WeComClientMessage = {
         cmd: 'aibot_respond_msg',
         headers: { req_id: pending.reqId },
         body: {
           msgtype: 'stream',
-          stream: {
-            id: streamId,
-            finish: true,
-            content,
-          },
+          stream: { id: streamId, finish: true, content },
         },
       };
 
@@ -228,8 +188,6 @@ export class WeComAdapter extends BaseChannelAdapter {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
-
-  // ── Config & Auth ───────────────────────────────────────────
 
   private loadConfig(): WeComConfig {
     const store = getBridgeContext().store;
@@ -249,18 +207,12 @@ export class WeComAdapter extends BaseChannelAdapter {
   isAuthorized(userId: string, _chatId: string): boolean {
     const allowedUsers = getBridgeContext().store.getSetting('bridge_wecom_allowed_users') || '';
     if (!allowedUsers) return true;
-
-    const allowed = allowedUsers
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-
+    const allowed = allowedUsers.split(',').map(s => s.trim()).filter(Boolean);
     if (allowed.length === 0) return true;
-
     return allowed.includes(userId);
   }
 
-  // ── WebSocket Connection ──────────────────────────────────────
+  // ── WebSocket ────────────────────────────────────────────────
 
   private async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -269,16 +221,14 @@ export class WeComAdapter extends BaseChannelAdapter {
       let resolved = false;
 
       ws.on('open', () => {
-        console.log('[wecom-adapter] WebSocket connected, sending subscribe...');
+        console.log('[wecom-adapter] Connected, subscribing...');
         this.subscribe();
       });
 
       ws.on('message', (data) => {
         try {
-          const msg = JSON.parse(data.toString()) as WeComMessage;
+          const msg = JSON.parse(data.toString()) as WeComServerMessage;
           this.handleMessage(msg);
-
-          // Resolve on successful subscribe
           if (msg.cmd === 'aibot_subscribe' && msg.errcode === 0 && !resolved) {
             resolved = true;
             this.reconnectAttempts = 0;
@@ -286,211 +236,143 @@ export class WeComAdapter extends BaseChannelAdapter {
             resolve();
           }
         } catch (err) {
-          console.error('[wecom-adapter] Failed to parse message:', err);
+          console.error('[wecom-adapter] Parse error:', err);
         }
       });
 
       ws.on('close', (code, reason) => {
-        console.log(`[wecom-adapter] WebSocket closed: code=${code}, reason=${reason.toString()}`);
+        console.log(`[wecom-adapter] Closed: ${code} ${reason}`);
         this.stopHeartbeat();
-
         if (!resolved) {
           resolved = true;
-          reject(new Error(`WebSocket closed before subscribe: code=${code}`));
+          reject(new Error(`Closed before subscribe: ${code}`));
           return;
         }
-
-        if (this.shouldReconnect) {
-          this.scheduleReconnect();
-        }
+        if (this.shouldReconnect) this.scheduleReconnect();
       });
 
       ws.on('error', (err) => {
-        console.error('[wecom-adapter] WebSocket error:', err.message);
+        console.error('[wecom-adapter] Error:', err.message);
       });
     });
   }
 
   private subscribe(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    const msg: WeComMessage = {
+    const msg: WeComClientMessage = {
       cmd: 'aibot_subscribe',
-      headers: { req_id: generateReqId() },
-      body: {
-        bot_id: this.config!.botId,
-        secret: this.config!.secret,
-      },
+      headers: { req_id: uuid() },
+      body: { bot_id: this.config!.botId, secret: this.config!.secret },
     };
-
     this.ws.send(JSON.stringify(msg));
   }
 
-  private handleMessage(msg: WeComMessage): void {
+  private handleMessage(msg: WeComServerMessage): void {
     switch (msg.cmd) {
       case 'aibot_subscribe':
-        if (msg.errcode === 0) {
-          console.log('[wecom-adapter] Subscribed successfully');
-        } else {
-          console.error('[wecom-adapter] Subscribe failed:', msg.errmsg);
-        }
+        if (msg.errcode === 0) console.log('[wecom-adapter] Subscribed');
+        else console.error('[wecom-adapter] Subscribe failed:', msg.errmsg);
         break;
-
       case 'aibot_msg_callback':
         this.handleMsgCallback(msg);
         break;
-
       case 'aibot_event_callback':
         this.handleEventCallback(msg);
-        break;
-
-      case 'pong':
-        // Heartbeat response
         break;
     }
   }
 
-  // ── Message Callback ──────────────────────────────────────────
-
-  private handleMsgCallback(msg: WeComMessage): void {
+  private handleMsgCallback(msg: WeComServerMessage): void {
     const body = msg.body;
     if (!body) return;
 
-    // Dedup
     if (this.seenMessageIds.has(body.msgid)) return;
     this.seenMessageIds.set(body.msgid, true);
 
-    // Evict oldest when exceeding limit
     if (this.seenMessageIds.size > DEDUP_MAX) {
       const excess = this.seenMessageIds.size - DEDUP_MAX;
       let removed = 0;
       for (const key of this.seenMessageIds.keys()) {
-        if (removed >= excess) break;
+        if (removed++ >= excess) break;
         this.seenMessageIds.delete(key);
-        removed++;
       }
     }
 
     const userId = body.from.userid;
-
-    // Authorization check
     if (!this.isAuthorized(userId, body.chatid || userId)) {
-      console.warn('[wecom-adapter] Unauthorized message from:', userId);
+      console.warn('[wecom-adapter] Unauthorized:', userId);
       return;
     }
 
     const chatId = body.chattype === 'group' && body.chatid ? body.chatid : userId;
-
-    // Store pending request for reply (valid for 24h)
     this.pendingRequests.set(chatId, {
       chatId,
       reqId: msg.headers.req_id,
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     });
 
-    // Extract text content
     let text = '';
     switch (body.msgtype) {
-      case 'text':
-        text = body.text?.content || '';
-        break;
-      case 'voice':
-        text = body.voice?.content || '[语音消息]';
-        break;
+      case 'text': text = body.text?.content || ''; break;
+      case 'voice': text = body.voice?.content || '[语音]'; break;
       case 'mixed':
-        text = body.mixed?.msg_item
-          .map((item) => item.text?.content || '[图片]')
-          .join(' ') || '';
+        text = body.mixed?.msg_item.map(i => i.text?.content || '[图]').join(' ') || '';
         break;
-      case 'image':
-        text = '[图片消息]';
-        break;
-      case 'file':
-        text = '[文件消息]';
-        break;
-      default:
-        return;
+      case 'image': text = '[图片]'; break;
+      case 'file': text = '[文件]'; break;
+      default: return;
     }
 
     if (!text.trim()) return;
 
-    const inbound: InboundMessage = {
+    this.enqueue({
       messageId: body.msgid,
-      address: {
-        channelType: 'wecom',
-        chatId,
-        userId,
-        displayName: userId.slice(0, 8),
-      },
+      address: { channelType: 'wecom', chatId, userId, displayName: userId.slice(0, 8) },
       text: text.trim(),
       timestamp: Date.now(),
-    };
+    });
 
-    this.enqueue(inbound);
-
-    // Audit log
     try {
       getBridgeContext().store.insertAuditLog({
-        channelType: 'wecom',
-        chatId,
-        direction: 'inbound',
-        messageId: body.msgid,
-        summary: text.slice(0, 200),
+        channelType: 'wecom', chatId, direction: 'inbound',
+        messageId: body.msgid, summary: text.slice(0, 200),
       });
-    } catch { /* best effort */ }
+    } catch {}
   }
 
-  // ── Event Callback ────────────────────────────────────────────
-
-  private handleEventCallback(msg: WeComMessage): void {
+  private handleEventCallback(msg: WeComServerMessage): void {
     const body = msg.body;
     if (!body || body.msgtype !== 'event') return;
 
     const event = body.event?.eventtype;
     console.log('[wecom-adapter] Event:', event);
 
-    switch (event) {
-      case 'enter_chat':
-        // User entered chat - could send welcome message
-        const userId = body.from.userid;
-        if (this.isAuthorized(userId, '')) {
-          this.sendWelcomeMessage(msg.headers.req_id);
-        }
-        break;
-
-      case 'disconnected_event':
-        // Another connection took over
-        console.warn('[wecom-adapter] Disconnected by another connection');
-        this._running = false;
-        break;
+    if (event === 'enter_chat' && body.from) {
+      const userId = body.from.userid;
+      if (this.isAuthorized(userId, '')) {
+        this.sendWelcome(msg.headers.req_id);
+      }
+    } else if (event === 'disconnected_event') {
+      console.warn('[wecom-adapter] Disconnected by another connection');
+      this._running = false;
     }
   }
 
-  private sendWelcomeMessage(reqId: string): void {
+  private sendWelcome(reqId: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    const msg: WeComMessage = {
+    const msg: WeComClientMessage = {
       cmd: 'aibot_respond_welcome_msg',
       headers: { req_id: reqId },
-      body: {
-        msgtype: 'text',
-        text: { content: '你好！我是 AI 编程助手，有什么可以帮你的吗？' },
-      },
+      body: { msgtype: 'text', text: { content: '你好！我是 AI 编程助手，有什么可以帮你的吗？' } },
     };
-
     this.ws.send(JSON.stringify(msg));
   }
-
-  // ── Heartbeat ────────────────────────────────────────────────
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        const msg: WeComMessage = {
-          cmd: 'ping',
-          headers: { req_id: generateReqId() },
-        };
+        const msg: WeComClientMessage = { cmd: 'ping', headers: { req_id: uuid() } };
         this.ws.send(JSON.stringify(msg));
       }
     }, HEARTBEAT_INTERVAL);
@@ -503,25 +385,16 @@ export class WeComAdapter extends BaseChannelAdapter {
     }
   }
 
-  // ── Reconnection ──────────────────────────────────────────────
-
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
-
     this.reconnectAttempts++;
-    const delay = Math.min(
-      RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1),
-      MAX_RECONNECT_DELAY
-    );
-
-    console.log(`[wecom-adapter] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
+    const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+    console.log(`[wecom-adapter] Reconnecting in ${delay}ms`);
     setTimeout(async () => {
       if (!this.shouldReconnect) return;
-
       try {
         await this.connect();
-        console.log('[wecom-adapter] Reconnected successfully');
+        console.log('[wecom-adapter] Reconnected');
       } catch (err) {
         console.error('[wecom-adapter] Reconnect failed:', err);
         this.scheduleReconnect();
@@ -530,5 +403,4 @@ export class WeComAdapter extends BaseChannelAdapter {
   }
 }
 
-// Self-register so bridge-manager can create WeComAdapter via the registry.
 registerAdapterFactory('wecom', () => new WeComAdapter());
