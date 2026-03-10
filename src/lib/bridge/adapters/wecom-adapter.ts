@@ -1,18 +1,21 @@
 /**
  * WeCom (企业微信) Adapter — implements BaseChannelAdapter for WeCom AI Bot API.
  *
- * Uses HTTP callback server for receiving messages and response_url for replying.
- * WeCom AI Bot (智能机器人) supports single chat (C2C) and group chat interactions.
+ * Uses WebSocket long connection for receiving messages and replying.
+ * This approach does NOT require a public IP or message encryption.
+ *
+ * Based on official @wecom/aibot-node-sdk pattern.
  *
  * Message flow:
- * 1. WeCom server sends encrypted JSON callback to our HTTP endpoint
- * 2. We decrypt the message using AES-256-CBC
- * 3. Process the message and queue it for consumption
- * 4. Reply using the response_url provided in the callback
+ * 1. Connect to wss://openws.work.weixin.qq.com
+ * 2. Subscribe with BotID + Secret
+ * 3. Receive messages via aibot_msg_callback
+ * 4. Reply via aibot_respond_msg (supports streaming)
+ * 5. Keep alive with ping heartbeat
  */
 
 import crypto from 'crypto';
-import http from 'http';
+import WebSocket from 'ws';
 import type {
   ChannelType,
   InboundMessage,
@@ -25,81 +28,63 @@ import { getBridgeContext } from '../context.js';
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
 
-/** Default callback server port. */
-const DEFAULT_PORT = 3100;
+/** WebSocket gateway URL. */
+const GATEWAY_URL = 'wss://openws.work.weixin.qq.com';
 
-/** Callback path for WeCom messages. */
-const CALLBACK_PATH = '/wecom/callback';
+/** Heartbeat interval (30 seconds). */
+const HEARTBEAT_INTERVAL = 30000;
+
+/** Reconnect delay base (exponential backoff). */
+const RECONNECT_BASE_DELAY = 1000;
+const MAX_RECONNECT_DELAY = 60000;
 
 // ── Types ──────────────────────────────────────────────────────
 
 interface WeComConfig {
   botId: string;
-  token: string;
-  encodingAesKey: string;
-  callbackPort: number;
+  secret: string;
 }
 
-interface WeComCallback {
+interface WeComMessage {
+  cmd: string;
+  headers: {
+    req_id: string;
+  };
+  body?: WeComCallbackBody;
+  errcode?: number;
+  errmsg?: string;
+}
+
+interface WeComCallbackBody {
   msgid: string;
   aibotid: string;
   chatid?: string;
   chattype: 'single' | 'group';
   from: { userid: string };
-  response_url: string;
-  msgtype: 'text' | 'image' | 'mixed' | 'voice' | 'file';
+  msgtype: 'text' | 'image' | 'mixed' | 'voice' | 'file' | 'event';
   text?: { content: string };
-  image?: { url: string };
+  image?: { url: string; aeskey?: string };
   mixed?: { msg_item: Array<{ msgtype: string; text?: { content: string }; image?: { url: string } }> };
   voice?: { content: string };
-  file?: { url: string };
+  file?: { url: string; aeskey?: string };
+  event?: { eventtype: string };
 }
 
-interface PendingResponse {
-  responseUrl: string;
+interface PendingRequest {
+  chatId: string;
+  reqId: string;
   expiresAt: number;
+  streamId?: string;
 }
 
-// ── AES Cryptography (WeCom style) ─────────────────────────────
+// ── Helper Functions ────────────────────────────────────────────
 
-/**
- * Decrypt WeCom encrypted message.
- * WeCom uses AES-256-CBC with PKCS#7 padding.
- * Key is base64-decoded EncodingAESKey (43 chars, decoded to 32 bytes).
- * IV is first 16 bytes of the key.
- */
-function decryptWeComMessage(encryptedBase64: string, encodingAesKey: string): string {
-  // EncodingAESKey is 43 chars, base64 decode to 32 bytes + 1 byte checksum
-  const key = Buffer.from(encodingAesKey + '=', 'base64');
-  const iv = key.slice(0, 16);
-
-  const encrypted = Buffer.from(encryptedBase64, 'base64');
-  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-  decipher.setAutoPadding(false);
-
-  let decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-
-  // Remove PKCS#7 padding
-  const pad = decrypted[decrypted.length - 1];
-  decrypted = decrypted.slice(0, decrypted.length - pad);
-
-  // WeCom format: random(16) + msg_len(4) + msg + receiveid
-  // msg_len is network byte order (big-endian)
-  const msgLen = decrypted.readUInt32BE(16);
-  const msg = decrypted.slice(20, 20 + msgLen).toString('utf8');
-
-  return msg;
+function generateReqId(): string {
+  return crypto.randomUUID();
 }
 
-/**
- * Compute signature for URL verification.
- */
-function computeSignature(token: string, timestamp: string, nonce: string, echostr?: string): string {
-  const arr = [token, timestamp, nonce];
-  if (echostr) arr.push(echostr);
-  arr.sort();
-  const str = arr.join('');
-  return crypto.createHash('sha1').update(str).digest('hex');
+function generateStreamId(): string {
+  return crypto.randomUUID().replace(/-/g, '');
 }
 
 // ── WeCom Adapter ───────────────────────────────────────────────
@@ -110,10 +95,13 @@ export class WeComAdapter extends BaseChannelAdapter {
   private _running = false;
   private queue: InboundMessage[] = [];
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
-  private server: http.Server | null = null;
+  private ws: WebSocket | null = null;
   private seenMessageIds = new Map<string, boolean>();
   private config: WeComConfig | null = null;
-  private pendingResponses = new Map<string, PendingResponse>();
+  private pendingRequests = new Map<string, PendingRequest>();
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectAttempts = 0;
+  private shouldReconnect = false;
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -128,21 +116,26 @@ export class WeComAdapter extends BaseChannelAdapter {
 
     this.config = this.loadConfig();
     this._running = true;
+    this.shouldReconnect = true;
+    this.reconnectAttempts = 0;
 
-    await this.startHttpServer();
+    await this.connect();
 
-    console.log('[wecom-adapter] Started, listening on port', this.config.callbackPort);
+    console.log('[wecom-adapter] Started');
   }
 
   async stop(): Promise<void> {
     if (!this._running) return;
     this._running = false;
+    this.shouldReconnect = false;
 
-    if (this.server) {
-      await new Promise<void>((resolve) => {
-        this.server!.close(() => resolve());
-      });
-      this.server = null;
+    this.stopHeartbeat();
+
+    if (this.ws) {
+      try {
+        this.ws.close(1000, 'adapter stopping');
+      } catch { /* ignore */ }
+      this.ws = null;
     }
 
     // Wake all waiters with null
@@ -152,7 +145,7 @@ export class WeComAdapter extends BaseChannelAdapter {
     this.waiters = [];
     this.queue = [];
     this.seenMessageIds.clear();
-    this.pendingResponses.clear();
+    this.pendingRequests.clear();
 
     console.log('[wecom-adapter] Stopped');
   }
@@ -186,15 +179,18 @@ export class WeComAdapter extends BaseChannelAdapter {
   // ── Send ────────────────────────────────────────────────────
 
   async send(message: OutboundMessage): Promise<SendResult> {
-    // Look up pending response URL for this chat
-    const pending = this.pendingResponses.get(message.address.chatId);
+    const pending = this.pendingRequests.get(message.address.chatId);
     if (!pending) {
-      return { ok: false, error: 'No response_url available for this chat' };
+      return { ok: false, error: 'No pending request for this chat. User must send a message first.' };
     }
 
     if (Date.now() > pending.expiresAt) {
-      this.pendingResponses.delete(message.address.chatId);
-      return { ok: false, error: 'response_url expired (valid for 1 hour)' };
+      this.pendingRequests.delete(message.address.chatId);
+      return { ok: false, error: 'Request expired (24h limit for replies)' };
+    }
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return { ok: false, error: 'WebSocket not connected' };
     }
 
     try {
@@ -206,23 +202,27 @@ export class WeComAdapter extends BaseChannelAdapter {
         content = content.replace(/<i>(.*?)<\/i>/gi, '*$1*');
         content = content.replace(/<code>(.*?)<\/code>/gi, '`$1`');
         content = content.replace(/<pre>(.*?)<\/pre>/gis, '```\n$1\n```');
-        content = content.replace(/<[^>]+>/g, ''); // Remove other HTML tags
+        content = content.replace(/<[^>]+>/g, '');
       }
 
-      const response = await fetch(pending.responseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          msgtype: 'markdown',
-          markdown: { content },
-        }),
-      });
+      // Use streaming message for better UX
+      const streamId = pending.streamId || generateStreamId();
+      pending.streamId = streamId;
 
-      if (!response.ok) {
-        const text = await response.text();
-        return { ok: false, error: `WeCom API error: ${response.status} ${text}` };
-      }
+      const msg: WeComMessage = {
+        cmd: 'aibot_respond_msg',
+        headers: { req_id: pending.reqId },
+        body: {
+          msgtype: 'stream',
+          stream: {
+            id: streamId,
+            finish: true,
+            content,
+          },
+        },
+      };
 
+      this.ws.send(JSON.stringify(msg));
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -235,20 +235,14 @@ export class WeComAdapter extends BaseChannelAdapter {
     const store = getBridgeContext().store;
     return {
       botId: store.getSetting('bridge_wecom_bot_id') || '',
-      token: store.getSetting('bridge_wecom_token') || '',
-      encodingAesKey: store.getSetting('bridge_wecom_encoding_aes_key') || '',
-      callbackPort: parseInt(store.getSetting('bridge_wecom_callback_port') || '', 10) || DEFAULT_PORT,
+      secret: store.getSetting('bridge_wecom_secret') || '',
     };
   }
 
   validateConfig(): string | null {
     const config = this.loadConfig();
     if (!config.botId) return 'bridge_wecom_bot_id not configured';
-    if (!config.token) return 'bridge_wecom_token not configured';
-    if (!config.encodingAesKey) return 'bridge_wecom_encoding_aes_key not configured';
-    if (config.encodingAesKey.length !== 43) {
-      return 'bridge_wecom_encoding_aes_key must be 43 characters';
-    }
+    if (!config.secret) return 'bridge_wecom_secret not configured';
     return null;
   }
 
@@ -266,151 +260,105 @@ export class WeComAdapter extends BaseChannelAdapter {
     return allowed.includes(userId);
   }
 
-  // ── HTTP Server ──────────────────────────────────────────────
+  // ── WebSocket Connection ──────────────────────────────────────
 
-  private async startHttpServer(): Promise<void> {
-    const config = this.config!;
-
+  private async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
-        this.handleHttpRequest(req, res).catch((err) => {
-          console.error('[wecom-adapter] HTTP handler error:', err);
-          res.statusCode = 500;
-          res.end('Internal Server Error');
-        });
+      const ws = new WebSocket(GATEWAY_URL);
+      this.ws = ws;
+      let resolved = false;
+
+      ws.on('open', () => {
+        console.log('[wecom-adapter] WebSocket connected, sending subscribe...');
+        this.subscribe();
       });
 
-      this.server.on('error', (err) => {
-        console.error('[wecom-adapter] HTTP server error:', err);
-        if (!this._running) {
-          reject(err);
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString()) as WeComMessage;
+          this.handleMessage(msg);
+
+          // Resolve on successful subscribe
+          if (msg.cmd === 'aibot_subscribe' && msg.errcode === 0 && !resolved) {
+            resolved = true;
+            this.reconnectAttempts = 0;
+            this.startHeartbeat();
+            resolve();
+          }
+        } catch (err) {
+          console.error('[wecom-adapter] Failed to parse message:', err);
         }
       });
 
-      this.server.listen(config.callbackPort, () => {
-        resolve();
+      ws.on('close', (code, reason) => {
+        console.log(`[wecom-adapter] WebSocket closed: code=${code}, reason=${reason.toString()}`);
+        this.stopHeartbeat();
+
+        if (!resolved) {
+          resolved = true;
+          reject(new Error(`WebSocket closed before subscribe: code=${code}`));
+          return;
+        }
+
+        if (this.shouldReconnect) {
+          this.scheduleReconnect();
+        }
+      });
+
+      ws.on('error', (err) => {
+        console.error('[wecom-adapter] WebSocket error:', err.message);
       });
     });
   }
 
-  private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const config = this.config!;
-    const url = new URL(req.url || '/', `http://localhost:${config.callbackPort}`);
+  private subscribe(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Only handle callback path
-    if (!url.pathname.startsWith(CALLBACK_PATH)) {
-      res.statusCode = 404;
-      res.end('Not Found');
-      return;
-    }
+    const msg: WeComMessage = {
+      cmd: 'aibot_subscribe',
+      headers: { req_id: generateReqId() },
+      body: {
+        bot_id: this.config!.botId,
+        secret: this.config!.secret,
+      },
+    };
 
-    const query = url.searchParams;
-    const signature = query.get('msg_signature') || '';
-    const timestamp = query.get('timestamp') || '';
-    const nonce = query.get('nonce') || '';
-
-    // ── URL Verification (GET) ─────────────────────────────────
-    if (req.method === 'GET') {
-      const echostr = query.get('echostr');
-
-      if (!echostr) {
-        res.statusCode = 400;
-        res.end('Missing echostr');
-        return;
-      }
-
-      // Verify signature
-      const expectedSig = computeSignature(config.token, timestamp, nonce, echostr);
-      if (signature !== expectedSig) {
-        console.warn('[wecom-adapter] URL verification signature mismatch');
-        res.statusCode = 403;
-        res.end('Signature verification failed');
-        return;
-      }
-
-      // Decrypt echostr and return it
-      try {
-        const decrypted = decryptWeComMessage(echostr, config.encodingAesKey);
-        console.log('[wecom-adapter] URL verification successful');
-        res.statusCode = 200;
-        res.end(decrypted);
-        return;
-      } catch (err) {
-        console.error('[wecom-adapter] Failed to decrypt echostr:', err);
-        res.statusCode = 500;
-        res.end('Decryption failed');
-        return;
-      }
-    }
-
-    // ── Message Callback (POST) ─────────────────────────────────
-    if (req.method === 'POST') {
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk;
-      }
-
-      // Verify signature (without body for POST)
-      const expectedSig = computeSignature(config.token, timestamp, nonce);
-      if (signature !== expectedSig) {
-        console.warn('[wecom-adapter] POST signature mismatch');
-        res.statusCode = 403;
-        res.end('Signature verification failed');
-        return;
-      }
-
-      // Parse encrypted JSON
-      let encryptedData: { encrypt: string };
-      try {
-        encryptedData = JSON.parse(body);
-      } catch {
-        res.statusCode = 400;
-        res.end('Invalid JSON');
-        return;
-      }
-
-      // Decrypt message
-      let decryptedJson: string;
-      try {
-        decryptedJson = decryptWeComMessage(encryptedData.encrypt, config.encodingAesKey);
-      } catch (err) {
-        console.error('[wecom-adapter] Failed to decrypt message:', err);
-        res.statusCode = 500;
-        res.end('Decryption failed');
-        return;
-      }
-
-      // Parse decrypted JSON
-      let callback: WeComCallback;
-      try {
-        callback = JSON.parse(decryptedJson);
-      } catch {
-        console.error('[wecom-adapter] Failed to parse decrypted JSON:', decryptedJson);
-        res.statusCode = 400;
-        res.end('Invalid decrypted JSON');
-        return;
-      }
-
-      // Process message
-      this.handleCallback(callback);
-
-      // Respond with success (empty response)
-      res.statusCode = 200;
-      res.end('');
-      return;
-    }
-
-    // Method not allowed
-    res.statusCode = 405;
-    res.end('Method Not Allowed');
+    this.ws.send(JSON.stringify(msg));
   }
 
-  // ── Callback Handling ────────────────────────────────────────
+  private handleMessage(msg: WeComMessage): void {
+    switch (msg.cmd) {
+      case 'aibot_subscribe':
+        if (msg.errcode === 0) {
+          console.log('[wecom-adapter] Subscribed successfully');
+        } else {
+          console.error('[wecom-adapter] Subscribe failed:', msg.errmsg);
+        }
+        break;
 
-  private handleCallback(callback: WeComCallback): void {
+      case 'aibot_msg_callback':
+        this.handleMsgCallback(msg);
+        break;
+
+      case 'aibot_event_callback':
+        this.handleEventCallback(msg);
+        break;
+
+      case 'pong':
+        // Heartbeat response
+        break;
+    }
+  }
+
+  // ── Message Callback ──────────────────────────────────────────
+
+  private handleMsgCallback(msg: WeComMessage): void {
+    const body = msg.body;
+    if (!body) return;
+
     // Dedup
-    if (this.seenMessageIds.has(callback.msgid)) return;
-    this.seenMessageIds.set(callback.msgid, true);
+    if (this.seenMessageIds.has(body.msgid)) return;
+    this.seenMessageIds.set(body.msgid, true);
 
     // Evict oldest when exceeding limit
     if (this.seenMessageIds.size > DEDUP_MAX) {
@@ -423,31 +371,34 @@ export class WeComAdapter extends BaseChannelAdapter {
       }
     }
 
-    const userId = callback.from.userid;
+    const userId = body.from.userid;
 
     // Authorization check
-    if (!this.isAuthorized(userId, callback.chatid || userId)) {
+    if (!this.isAuthorized(userId, body.chatid || userId)) {
       console.warn('[wecom-adapter] Unauthorized message from:', userId);
       return;
     }
 
-    // Store response_url for later use (valid for 1 hour)
-    this.pendingResponses.set(callback.chatid || userId, {
-      responseUrl: callback.response_url,
-      expiresAt: Date.now() + 60 * 60 * 1000,
+    const chatId = body.chattype === 'group' && body.chatid ? body.chatid : userId;
+
+    // Store pending request for reply (valid for 24h)
+    this.pendingRequests.set(chatId, {
+      chatId,
+      reqId: msg.headers.req_id,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     });
 
     // Extract text content
     let text = '';
-    switch (callback.msgtype) {
+    switch (body.msgtype) {
       case 'text':
-        text = callback.text?.content || '';
+        text = body.text?.content || '';
         break;
       case 'voice':
-        text = callback.voice?.content || '[语音消息]';
+        text = body.voice?.content || '[语音消息]';
         break;
       case 'mixed':
-        text = callback.mixed?.msg_item
+        text = body.mixed?.msg_item
           .map((item) => item.text?.content || '[图片]')
           .join(' ') || '';
         break;
@@ -457,14 +408,14 @@ export class WeComAdapter extends BaseChannelAdapter {
       case 'file':
         text = '[文件消息]';
         break;
+      default:
+        return;
     }
 
     if (!text.trim()) return;
 
-    const chatId = callback.chattype === 'group' && callback.chatid ? callback.chatid : userId;
-
     const inbound: InboundMessage = {
-      messageId: callback.msgid,
+      messageId: body.msgid,
       address: {
         channelType: 'wecom',
         chatId,
@@ -483,10 +434,99 @@ export class WeComAdapter extends BaseChannelAdapter {
         channelType: 'wecom',
         chatId,
         direction: 'inbound',
-        messageId: callback.msgid,
+        messageId: body.msgid,
         summary: text.slice(0, 200),
       });
     } catch { /* best effort */ }
+  }
+
+  // ── Event Callback ────────────────────────────────────────────
+
+  private handleEventCallback(msg: WeComMessage): void {
+    const body = msg.body;
+    if (!body || body.msgtype !== 'event') return;
+
+    const event = body.event?.eventtype;
+    console.log('[wecom-adapter] Event:', event);
+
+    switch (event) {
+      case 'enter_chat':
+        // User entered chat - could send welcome message
+        const userId = body.from.userid;
+        if (this.isAuthorized(userId, '')) {
+          this.sendWelcomeMessage(msg.headers.req_id);
+        }
+        break;
+
+      case 'disconnected_event':
+        // Another connection took over
+        console.warn('[wecom-adapter] Disconnected by another connection');
+        this._running = false;
+        break;
+    }
+  }
+
+  private sendWelcomeMessage(reqId: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const msg: WeComMessage = {
+      cmd: 'aibot_respond_welcome_msg',
+      headers: { req_id: reqId },
+      body: {
+        msgtype: 'text',
+        text: { content: '你好！我是 AI 编程助手，有什么可以帮你的吗？' },
+      },
+    };
+
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  // ── Heartbeat ────────────────────────────────────────────────
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        const msg: WeComMessage = {
+          cmd: 'ping',
+          headers: { req_id: generateReqId() },
+        };
+        this.ws.send(JSON.stringify(msg));
+      }
+    }, HEARTBEAT_INTERVAL);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  // ── Reconnection ──────────────────────────────────────────────
+
+  private scheduleReconnect(): void {
+    if (!this.shouldReconnect) return;
+
+    this.reconnectAttempts++;
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * Math.pow(2, this.reconnectAttempts - 1),
+      MAX_RECONNECT_DELAY
+    );
+
+    console.log(`[wecom-adapter] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+
+    setTimeout(async () => {
+      if (!this.shouldReconnect) return;
+
+      try {
+        await this.connect();
+        console.log('[wecom-adapter] Reconnected successfully');
+      } catch (err) {
+        console.error('[wecom-adapter] Reconnect failed:', err);
+        this.scheduleReconnect();
+      }
+    }, delay);
   }
 }
 
