@@ -220,7 +220,7 @@ export class WeComAdapter extends BaseChannelAdapter {
 
       if (!response.ok) {
         const text = await response.text();
-        return { ok: false, error: \`WeCom API error: \${response.status} \${text}\` };
+        return { ok: false, error: `WeCom API error: ${response.status} ${text}` };
       }
 
       return { ok: true };
@@ -295,7 +295,7 @@ export class WeComAdapter extends BaseChannelAdapter {
 
   private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const config = this.config!;
-    const url = new URL(req.url || '/', \`http://localhost:\${config.callbackPort}\`);
+    const url = new URL(req.url || '/', `http://localhost:${config.callbackPort}`);
 
     // Only handle callback path
     if (!url.pathname.startsWith(CALLBACK_PATH)) {
